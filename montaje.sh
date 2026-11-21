@@ -3,6 +3,10 @@
 #  TALLER EVALUATIVO DE SISTEMAS OPERATIVOS  -  MONTAJE DEL ESCENARIO
 #  Tecnologia en Sistematizacion de Datos
 #  Uso:   bash montaje.sh <CODIGO-DE-ESTUDIANTE>
+#
+#  El script comprueba su propio trabajo al final y avisa si algo
+#  no quedo montado. Si no termina con "ESCENARIO LISTO", avise al
+#  docente antes de continuar.
 # =====================================================================
 set -u
 
@@ -18,6 +22,17 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+# ---------- requisitos ----------
+FALTAN=""
+for cmd in losetup mdadm mkfs.ext4 truncate python3 df dd; do
+  command -v "$cmd" >/dev/null 2>&1 || FALTAN="$FALTAN $cmd"
+done
+if [ -n "$FALTAN" ]; then
+  echo "ERROR: faltan herramientas en esta maquina:$FALTAN"
+  echo "Avise al docente: el entorno no es el correcto."
+  exit 1
+fi
+
 BASE=/opt/taller
 mkdir -p "$BASE"
 
@@ -25,9 +40,8 @@ mkdir -p "$BASE"
 SEM=$(printf '%s' "$CODIGO" | md5sum | tr -dc '0-9' | cut -c1-9)
 SEM=$((10#$SEM))
 
-INODOS=$(( 320 + SEM % 180 ))        # 320 - 499
 MEMMB=$(( 140 + (SEM / 7) % 160 ))   # 140 - 299 MB
-CACHEMB=$(( 400 + (SEM / 13) % 300 ))
+INODOS=$(( 320 + SEM % 180 ))        # 320 - 499
 FALLA=$(( SEM % 3 + 1 ))             # cual disco del arreglo falla
 
 echo "==================================================="
@@ -64,9 +78,20 @@ PY
 
 nohup python3 "$BASE/consumidor.py" "$MEMMB" >/dev/null 2>&1 &
 
-# llenar el cache de paginas leyendo un archivo grande
+# el llenado del cache se dimensiona segun la maquina: sin esto, en un
+# equipo grande la memoria libre no baja y el sintoma no aparece
+sleep 2
+LIBRE_MEM=$(free -m | awk '/^Mem:/ {print $4}')
+LIBRE_DISCO=$(df -m "$BASE" | awk 'NR==2 {print $4}')
+CACHEMB=$(( LIBRE_MEM * 75 / 100 ))
+TOPE_DISCO=$(( LIBRE_DISCO / 3 ))
+[ "$CACHEMB" -gt "$TOPE_DISCO" ] && CACHEMB=$TOPE_DISCO
+[ "$CACHEMB" -gt 6000 ] && CACHEMB=6000
+[ "$CACHEMB" -lt 200 ]  && CACHEMB=200
+echo "    (llenando el cache con ${CACHEMB} MB)"
 dd if=/dev/zero of="$BASE/relleno.bin" bs=1M count="$CACHEMB" status=none 2>/dev/null
 cat "$BASE/relleno.bin" > /dev/null 2>&1
+sync
 
 # =====================================================================
 #  BLOQUE B  -  PROCESOS
@@ -86,7 +111,7 @@ EOF
 
 chmod +x "$BASE/padre.sh" "$BASE/hijo.sh"
 nohup "$BASE/padre.sh" >/dev/null 2>&1 &
-sleep 1
+sleep 2
 
 # =====================================================================
 #  BLOQUE C  -  SISTEMA DE ARCHIVOS
@@ -99,11 +124,9 @@ mkdir -p /mnt/datos
 mount -o loop "$BASE/volumen.img" /mnt/datos 2>/dev/null
 
 if mountpoint -q /mnt/datos; then
-  LIBRES=$(df -i /mnt/datos | awk 'NR==2 {print $4}')
-  CREAR=$(( LIBRES - 12 ))
-  ( cd /mnt/datos && for i in $(seq 1 "$CREAR"); do : > "reg_$i.dat"; done ) 2>/dev/null
-else
-  echo "    AVISO: no se pudo montar el volumen de datos."
+  # crear archivos vacios hasta agotar por completo los inodos
+  ( cd /mnt/datos && i=1; while : > "reg_$i.dat" 2>/dev/null; do i=$((i+1)); done ) 2>/dev/null
+  sync
 fi
 
 # =====================================================================
@@ -124,7 +147,7 @@ REPUESTO=$(losetup -f --show "$BASE/disco4.img" 2>/dev/null)
 
 # shellcheck disable=SC2086
 mdadm --create /dev/md0 --auto=yes --level=5 --raid-devices=3 $LOOPS --run >/dev/null 2>&1
-sleep 3
+sleep 4
 mkfs.ext4 -q -F /dev/md0 2>/dev/null
 mkdir -p /mnt/arreglo
 mount /dev/md0 /mnt/arreglo 2>/dev/null
@@ -135,25 +158,92 @@ if mountpoint -q /mnt/arreglo; then
   sync
 fi
 
-# provocar la falla de uno de los tres discos
 DISCO_FALLA=$(echo $LOOPS | cut -d' ' -f"$FALLA")
 mdadm --manage /dev/md0 --fail "$DISCO_FALLA" >/dev/null 2>&1
+sleep 1
 
-# limitar la velocidad de reconstruccion para que se pueda observar
-echo 2000 > /proc/sys/dev/raid/speed_limit_max 2>/dev/null
+if [ -w /proc/sys/dev/raid/speed_limit_max ]; then
+  echo 2000 > /proc/sys/dev/raid/speed_limit_max
+fi
 
-# =====================================================================
-#  REGISTRO
-# =====================================================================
+# ---------- registro ----------
 printf '%s' "$CODIGO" > "$BASE/.codigo"
 date +%s > "$BASE/.inicio"
 printf '%s' "$REPUESTO" > "$BASE/.repuesto"
 chmod 600 "$BASE/.codigo" "$BASE/.inicio" "$BASE/.repuesto" 2>/dev/null
 
+# =====================================================================
+#  COMPROBACION DEL PROPIO MONTAJE
+# =====================================================================
+echo
+echo "Comprobando el escenario..."
+A=0; B=0; CC=0; D=0
+DET_A="no se encontro el proceso consumidor"
+DET_B="no se encontraron los procesos padre e hijo"
+DET_C="el volumen /mnt/datos no quedo sin inodos"
+DET_D="el arreglo /dev/md0 no quedo degradado"
+
+if pgrep -f "$BASE/consumidor.py" >/dev/null 2>&1; then
+  M_LIBRE=$(free -m | awk '/^Mem:/ {print $4}')
+  M_DISP=$(free -m  | awk '/^Mem:/ {print $7}')
+  M_TOT=$(free -m   | awk '/^Mem:/ {print $2}')
+  BRECHA=$(( M_DISP - M_LIBRE ))
+  PCT_LIBRE=$(( M_LIBRE * 100 / M_TOT ))
+  if [ "$BRECHA" -ge 200 ]; then
+    A=1
+    DET_A="libre ${PCT_LIBRE} %, brecha libre-disponible de ${BRECHA} MB"
+  else
+    DET_A="la brecha entre libre y disponible es de solo ${BRECHA} MB: el sintoma no se nota"
+  fi
+fi
+
+if pgrep -f "$BASE/padre.sh" >/dev/null 2>&1 && pgrep -f "$BASE/hijo.sh" >/dev/null 2>&1; then
+  B=1; DET_B="padre e hijo en ejecucion"
+fi
+
+if mountpoint -q /mnt/datos 2>/dev/null; then
+  USO=$(df -i /mnt/datos | awk 'NR==2 {gsub("%","",$5); print $5}')
+  TOT=$(df -i /mnt/datos | awk 'NR==2 {print $2}')
+  if [ -n "${USO:-}" ] && [ "$USO" -ge 99 ]; then
+    CC=1; DET_C="$TOT inodos, todos ocupados"
+  else
+    DET_C="el volumen quedo con inodos libres (${USO:-?} % usado)"
+  fi
+fi
+
+if [ -e /proc/mdstat ] && grep -q "^md0" /proc/mdstat 2>/dev/null; then
+  if grep -A2 "^md0" /proc/mdstat | grep -qE "\[(_UU|U_U|UU_)\]"; then
+    if mountpoint -q /mnt/arreglo 2>/dev/null && [ -r /mnt/arreglo/datos_criticos.txt ]; then
+      D=1; DET_D="RAID 5 degradado, fallo $DISCO_FALLA, datos legibles"
+    else
+      DET_D="el arreglo esta degradado pero no se pudo montar"
+    fi
+  fi
+elif [ ! -e /proc/mdstat ]; then
+  DET_D="este nucleo no tiene soporte de RAID por software"
+fi
+
+TOTAL=$(( A + B + CC + D ))
+
 echo
 echo "==================================================="
-echo " ESCENARIO LISTO  -  codigo $CODIGO"
+printf " A  Memoria ............... %s  (%s)\n" "$([ $A  -eq 1 ] && echo 'LISTO' || echo 'FALLO')" "$DET_A"
+printf " B  Procesos .............. %s  (%s)\n" "$([ $B  -eq 1 ] && echo 'LISTO' || echo 'FALLO')" "$DET_B"
+printf " C  Sistema de archivos ... %s  (%s)\n" "$([ $CC -eq 1 ] && echo 'LISTO' || echo 'FALLO')" "$DET_C"
+printf " D  Arreglo de discos ..... %s  (%s)\n" "$([ $D  -eq 1 ] && echo 'LISTO' || echo 'FALLO')" "$DET_D"
 echo "==================================================="
+
+if [ "$TOTAL" -ne 4 ]; then
+  echo
+  echo " ATENCION: solo $TOTAL de 4 situaciones quedaron montadas."
+  echo " NO empiece el taller. Avise al docente ahora mismo e"
+  echo " indiquele cual bloque dice FALLO y que mensaje aparece."
+  echo
+  exit 1
+fi
+
+echo
+echo " ESCENARIO LISTO  -  codigo $CODIGO"
 echo
 echo " Hay cuatro situaciones por diagnosticar:"
 echo
